@@ -1,0 +1,30 @@
+# Веса моделей (большие бинарные файлы)
+*.pt
+*.onnx
+*.engine
+*.wts
+.onnx/
+
+# Датасеты
+datasets/
+coco128.yaml
+synthetic.yaml
+
+# Результаты бенчмарков
+results/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+
+# Системные
+.DS_Store
+Thumbs.db
