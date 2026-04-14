@@ -1,328 +1,31 @@
-import sys
 import os
 import glob
 import json
 import csv
-import time
-import traceback
+import logging
 from datetime import datetime
 from pathlib import Path
 
-try:
-    from PyQt5.QtWidgets import (
-        QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-        QPushButton, QLabel, QFileDialog, QTextEdit, QProgressBar,
-        QGroupBox, QComboBox, QLineEdit, QCheckBox, QMessageBox,
-        QTableWidget, QTableWidgetItem, QHeaderView
-    )
-    from PyQt5.QtCore import Qt, QThread, pyqtSignal
-    from PyQt5.QtGui import QFont, QTextCursor, QColor
-    from ultralytics import YOLO
-    import torch
-except ImportError as e:
-    print(f"Ошибка импорта: {e}")
-    print("Установите зависимости: pip install PyQt5 ultralytics torch")
-    sys.exit(1)
+import torch
+from PyQt5.QtWidgets import (
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLabel, QFileDialog, QTextEdit, QProgressBar,
+    QGroupBox, QComboBox, QLineEdit, QCheckBox, QMessageBox,
+    QTableWidget, QTableWidgetItem, QHeaderView
+)
+from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QFont, QTextCursor
 
-try:
-    import onnxruntime as ort
-    ORT_AVAILABLE = True
-except ImportError:
-    ORT_AVAILABLE = False
+from logging_setup import logger
+from constants import (
+    CUDA_AVAILABLE, FORMAT_CONFIGS, TABLE_HEADERS,
+    COLOR_GREEN, COLOR_RED
+)
+from utils import _parse_int, _yaml_exists_or_builtin
+from workers import (
+    DepsInstallThread, BenchmarkThread, ExportThread, RunAllThread
+)
 
-
-# ─── Константы ────────────────────────────────────────────────────────────────
-
-CUDA_AVAILABLE = torch.cuda.is_available()
-
-FORMAT_CONFIGS = {
-    'PyTorch':   {'format': None,     'half': False, 'int8': False, 'needs_cuda': False},
-    'ONNX FP32': {'format': 'onnx',   'half': False, 'int8': False, 'needs_cuda': False},
-    'ONNX FP16': {'format': 'onnx',   'half': True,  'int8': False, 'needs_cuda': False},
-    'ONNX INT8': {'format': 'onnx',   'half': False, 'int8': True,  'needs_cuda': False},
-    'TRT FP16':  {'format': 'engine', 'half': True,  'int8': False, 'needs_cuda': True},
-    'TRT INT8':  {'format': 'engine', 'half': False, 'int8': True,  'needs_cuda': True},
-}
-
-TABLE_HEADERS = ["Формат", "mAP50", "mAP50-95", "Время(с)", "Δ mAP50 vs PT", "Скорость vs PT", "Размер (МБ)", "Размер vs PT"]
-
-# Суффиксы для имён файлов экспортированных моделей
-EXPORT_SUFFIXES = {
-    'ONNX FP32': ('_fp32',     '.onnx'),
-    'ONNX FP16': ('_fp16',     '.onnx'),
-    'ONNX INT8': ('_int8',     '.onnx'),
-    'TRT FP16':  ('_trt_fp16', '.engine'),
-    'TRT INT8':  ('_trt_int8', '.engine'),
-}
-
-COLOR_GREEN = QColor(200, 240, 200)
-COLOR_RED   = QColor(255, 200, 200)
-COLOR_GRAY  = QColor(230, 230, 230)
-
-
-# ─── Вспомогательные функции ──────────────────────────────────────────────────
-
-def _parse_int(line_edit, default):
-    try:
-        return int(line_edit.text())
-    except ValueError:
-        return default
-
-
-# ─── BenchmarkThread ──────────────────────────────────────────────────────────
-
-class BenchmarkThread(QThread):
-    """Поток для валидации одной модели."""
-    log_signal      = pyqtSignal(str)
-    progress_signal = pyqtSignal(int)
-    finished_signal = pyqtSignal(dict)  # всегда эмитируется, {} при ошибке
-
-    def __init__(self, model_path, data_yaml, device, imgsz, half, batch_size, label=""):
-        super().__init__()
-        self.model_path = model_path
-        self.data_yaml  = data_yaml
-        self.device     = device
-        self.imgsz      = imgsz
-        self.half       = half
-        self.batch_size = batch_size
-        self.label      = label
-
-    def run(self):
-        try:
-            self.log_signal.emit(f"Бенчмарк [{self.label}]: {self.model_path}")
-            self.log_signal.emit(f"  Датасет: {self.data_yaml}  |  {self.device}, imgsz={self.imgsz}, batch={self.batch_size}")
-
-            model      = YOLO(self.model_path)
-            model_type = "ONNX" if self.model_path.endswith('.onnx') else \
-                         "TRT"  if self.model_path.endswith('.engine') else "PyTorch"
-            self.log_signal.emit(f"  Тип модели: {model_type}")
-
-            start   = time.perf_counter()
-            metrics = model.val(
-                data=self.data_yaml,
-                imgsz=self.imgsz,
-                batch=self.batch_size,
-                device=self.device,
-                half=self.half,
-                verbose=False,
-                plots=False,
-            )
-            val_time = time.perf_counter() - start
-
-            size_mb = os.path.getsize(self.model_path) / 1024 / 1024
-            self.log_signal.emit(f"  Готово за {val_time:.2f} сек.  Размер: {size_mb:.1f} МБ")
-            self.finished_signal.emit({
-                'label':        self.label,
-                'model_path':   self.model_path,
-                'model_type':   model_type,
-                'val_time':     val_time,
-                'map50':        float(metrics.box.map50),
-                'map50_95':     float(metrics.box.map),
-                'fitness':      float(metrics.fitness),
-                'file_size_mb': size_mb,
-            })
-        except Exception as e:
-            self.log_signal.emit(f"  Ошибка бенчмарка [{self.label}]: {e}")
-            traceback.print_exc()
-            self.finished_signal.emit({})  # Bug 1 fix: всегда эмитируем
-        finally:
-            self.progress_signal.emit(100)
-
-
-# ─── ExportThread ─────────────────────────────────────────────────────────────
-
-class ExportThread(QThread):
-    """Поток для экспорта модели в один формат."""
-    log_signal      = pyqtSignal(str)
-    progress_signal = pyqtSignal(int)
-    finished_signal = pyqtSignal(str)  # путь к файлу или "" при ошибке
-
-    def __init__(self, model_path, fmt_label, fmt_config, imgsz, opset, dynamic, simplify, data_yaml):
-        super().__init__()
-        self.model_path = model_path
-        self.fmt_label  = fmt_label
-        self.fmt_config = fmt_config
-        self.imgsz      = imgsz
-        self.opset      = opset
-        self.dynamic    = dynamic
-        self.simplify   = simplify
-        self.data_yaml  = data_yaml
-
-    def run(self):
-        try:
-            self.log_signal.emit(f"Загрузка модели для экспорта [{self.fmt_label}]...")
-            self.progress_signal.emit(20)
-            model = YOLO(self.model_path)
-
-            self.log_signal.emit(f"Экспорт в {self.fmt_label}...")
-            self.progress_signal.emit(40)
-
-            kwargs = dict(
-                format=self.fmt_config['format'],
-                imgsz=self.imgsz,
-                half=self.fmt_config['half'],
-                int8=self.fmt_config['int8'],
-                dynamic=self.dynamic,
-                simplify=self.simplify,
-                opset=self.opset,
-            )
-            if self.fmt_config['int8']:
-                kwargs['data'] = self.data_yaml
-
-            export_path = model.export(**kwargs)
-
-            self.progress_signal.emit(90)
-            self.log_signal.emit(f"Экспорт [{self.fmt_label}] завершён: {export_path}")
-            self.finished_signal.emit(str(export_path))
-        except Exception as e:
-            self.log_signal.emit(f"Ошибка экспорта [{self.fmt_label}]: {e}")
-            traceback.print_exc()
-            self.finished_signal.emit("")
-        finally:
-            self.progress_signal.emit(100)
-
-
-# ─── RunAllThread ─────────────────────────────────────────────────────────────
-
-class RunAllThread(QThread):
-    """Запускает экспорт + бенчмарк для всех выбранных форматов последовательно."""
-    log_signal      = pyqtSignal(str)
-    progress_signal = pyqtSignal(int)
-    step_signal     = pyqtSignal(str)
-    result_signal   = pyqtSignal(str, dict)
-    error_signal    = pyqtSignal(str)
-    finished_signal = pyqtSignal()
-
-    def __init__(self, pt_path, formats_to_run, data_yaml, device,
-                 imgsz, batch, opset, dynamic, simplify, half_pt):
-        super().__init__()
-        self.pt_path        = pt_path
-        self.formats_to_run = formats_to_run
-        self.data_yaml      = data_yaml
-        self.device         = device
-        self.imgsz          = imgsz
-        self.batch          = batch
-        self.opset          = opset
-        self.dynamic        = dynamic
-        self.simplify       = simplify
-        self.half_pt        = half_pt
-
-    def run(self):
-        total   = len(self.formats_to_run) * 2
-        current = 0
-
-        for label in self.formats_to_run:
-            cfg = FORMAT_CONFIGS[label]
-
-            # ── Экспорт ──────────────────────────────────────────────────────
-            if label == 'PyTorch':
-                model_path = self.pt_path
-                current += 1
-            else:
-                self.step_signal.emit(f"Экспорт {label}...")
-                model_path = self._do_export(label, cfg)
-                current += 1
-                self.progress_signal.emit(int(current / total * 100))
-
-                if not model_path:
-                    self.error_signal.emit(f"Экспорт {label} не удался — пропускаем")
-                    current += 1  # пропускаем и шаг бенчмарка
-                    self.progress_signal.emit(int(current / total * 100))
-                    continue
-
-            # ── Бенчмарк ─────────────────────────────────────────────────────
-            self.step_signal.emit(f"Бенчмарк {label}...")
-            half = self.half_pt if label == 'PyTorch' else cfg['half']
-            results = self._do_benchmark(model_path, label, half)
-            current += 1
-            self.progress_signal.emit(int(current / total * 100))
-
-            if results:
-                self.result_signal.emit(label, results)
-            else:
-                self.error_signal.emit(f"Бенчмарк {label} не удался")
-
-        self.step_signal.emit("Готово")
-        self.finished_signal.emit()
-
-    def _do_export(self, label, cfg):
-        try:
-            self.log_signal.emit(f"[Экспорт] {label}...")
-            model  = YOLO(self.pt_path)
-            kwargs = dict(
-                format=cfg['format'],
-                imgsz=self.imgsz,
-                half=cfg['half'],
-                int8=cfg['int8'],
-                dynamic=self.dynamic,
-                simplify=self.simplify,
-                opset=self.opset,
-            )
-            if cfg['int8']:
-                kwargs['data'] = self.data_yaml
-            raw_path = Path(str(model.export(**kwargs)))
-
-            # Копируем в .onnx/ рядом с исходным .pt под человекочитаемым именем
-            dest = self._copy_to_onnx_dir(raw_path, label)
-            self.log_signal.emit(f"  Сохранён: {dest}")
-            return str(dest)
-        except Exception as e:
-            msg = str(e)
-            if 'tensorrt' in msg.lower() or 'engine' in msg.lower():
-                self.log_signal.emit(f"  TensorRT недоступен: {msg}")
-            else:
-                self.log_signal.emit(f"  Ошибка: {msg}")
-            traceback.print_exc()
-            return ""
-
-    def _copy_to_onnx_dir(self, raw_path: Path, label: str) -> Path:
-        """Копирует экспортированный файл в {pt_dir}/.onnx/ с именем yolov8n_fp16.onnx."""
-        import shutil
-        pt_stem  = Path(self.pt_path).stem                    # e.g. "yolov8n"
-        suffix, ext = EXPORT_SUFFIXES.get(label, ('', raw_path.suffix))
-        dest_name = f"{pt_stem}{suffix}{ext}"                 # e.g. "yolov8n_fp16.onnx"
-
-        onnx_dir = Path(self.pt_path).parent / '.onnx'
-        onnx_dir.mkdir(exist_ok=True)
-        dest = onnx_dir / dest_name
-
-        if raw_path.resolve() != dest.resolve():
-            shutil.copy2(raw_path, dest)
-        return dest
-
-    def _do_benchmark(self, model_path, label, half):
-        try:
-            self.log_signal.emit(f"[Бенчмарк] {label}: {model_path}")
-            model   = YOLO(model_path)
-            start   = time.perf_counter()
-            metrics = model.val(
-                data=self.data_yaml,
-                imgsz=self.imgsz,
-                batch=self.batch,
-                device=self.device,
-                half=half,
-                verbose=False,
-                plots=False,
-            )
-            val_time = time.perf_counter() - start
-            size_mb = os.path.getsize(model_path) / 1024 / 1024
-            self.log_signal.emit(f"  mAP50={metrics.box.map50:.4f}  time={val_time:.1f}s  size={size_mb:.1f}MB")
-            return {
-                'label':       label,
-                'model_path':  model_path,
-                'val_time':    val_time,
-                'map50':       float(metrics.box.map50),
-                'map50_95':    float(metrics.box.map),
-                'fitness':     float(metrics.fitness),
-                'file_size_mb': size_mb,
-            }
-        except Exception as e:
-            self.log_signal.emit(f"  Ошибка: {e}")
-            traceback.print_exc()
-            return {}
-
-
-# ─── YOLOBenchmarkApp ─────────────────────────────────────────────────────────
 
 class YOLOBenchmarkApp(QMainWindow):
     def __init__(self):
@@ -333,6 +36,7 @@ class YOLOBenchmarkApp(QMainWindow):
         self.export_thread    = None
         self.benchmark_thread = None
         self.run_all_thread   = None
+        self.deps_thread      = None
 
         self.format_checkboxes = {}
         self.results_store     = {}
@@ -450,12 +154,16 @@ class YOLOBenchmarkApp(QMainWindow):
         opts_row.addWidget(self.dynamic_check)
 
         self.simplify_check = QCheckBox("Simplify")
-        self.simplify_check.setChecked(True)
+        self.simplify_check.setChecked(False)  # onnxslim медленный — включать вручную при необходимости
         opts_row.addWidget(self.simplify_check)
 
         self.half_pt_check = QCheckBox("FP16 для PyTorch")
         self.half_pt_check.setChecked(CUDA_AVAILABLE)
-        self.half_pt_check.setToolTip("Использовать half precision при валидации оригинальной PT модели")
+        if not CUDA_AVAILABLE:
+            self.half_pt_check.setEnabled(False)
+            self.half_pt_check.setToolTip("FP16 требует GPU — на CPU эмулируется и работает в десятки раз медленнее")
+        else:
+            self.half_pt_check.setToolTip("Использовать half precision при валидации оригинальной PT модели")
         opts_row.addWidget(self.half_pt_check)
 
         opts_row.addStretch()
@@ -543,9 +251,21 @@ class YOLOBenchmarkApp(QMainWindow):
         self.log_text.setMaximumHeight(180)
         layout.addWidget(self.log_text)
 
+        btn_row = QHBoxLayout()
         clear_btn = QPushButton("Очистить лог")
         clear_btn.clicked.connect(self.clear_log)
-        layout.addWidget(clear_btn)
+        open_log_btn = QPushButton("Открыть лог-файл")
+        open_log_btn.clicked.connect(self._open_log_file)
+        self.install_deps_btn = QPushButton("Установить зависимости")
+        self.install_deps_btn.setToolTip(
+            "Устанавливает onnx, onnxruntime (CPU или GPU) и tensorrt через pip"
+        )
+        self.install_deps_btn.clicked.connect(self.install_deps)
+        btn_row.addWidget(clear_btn)
+        btn_row.addWidget(open_log_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(self.install_deps_btn)
+        layout.addLayout(btn_row)
 
         group.setLayout(layout)
         return group
@@ -564,9 +284,18 @@ class YOLOBenchmarkApp(QMainWindow):
         ts = datetime.now().strftime("%H:%M:%S")
         self.log_text.append(f"[{ts}] {message}")
         self.log_text.moveCursor(QTextCursor.End)
+        logger.info(message)
 
     def clear_log(self):
         self.log_text.clear()
+
+    def _open_log_file(self):
+        log_dir = Path(__file__).parent / 'logs'
+        log_file = log_dir / f"app_{datetime.now().strftime('%Y%m%d')}.log"
+        if log_file.exists():
+            os.startfile(str(log_file))
+        else:
+            QMessageBox.information(self, "Лог", f"Лог-файл не найден:\n{log_file}")
 
     # ── Диалоги выбора файлов ─────────────────────────────────────────────────
 
@@ -598,18 +327,14 @@ class YOLOBenchmarkApp(QMainWindow):
         self.log(f"Найден yaml: {yamls[0]}")
 
     def update_model_info(self, path):
+        # Не загружаем модель в главном потоке — это блокирует Qt и может крашнуть
+        # на Windows из-за multiprocessing spawn. Показываем только метаданные файла.
         try:
-            if path.endswith('.pt'):
-                model = YOLO(path)
-                self.model_info_label.setText(f"PyTorch модель  |  task: {model.task}")
-            elif path.endswith('.onnx'):
-                if ORT_AVAILABLE:
-                    ort.InferenceSession(path, providers=['CPUExecutionProvider'])
-                self.model_info_label.setText("ONNX модель (валидна)")
-            elif path.endswith('.engine'):
-                self.model_info_label.setText("TensorRT engine")
-            else:
-                self.model_info_label.setText("Неизвестный формат")
+            size_mb = os.path.getsize(path) / 1024 / 1024
+            ext = Path(path).suffix.lower()
+            labels = {'.pt': 'PyTorch', '.onnx': 'ONNX', '.engine': 'TensorRT engine'}
+            fmt = labels.get(ext, 'Неизвестный формат')
+            self.model_info_label.setText(f"{fmt}  |  {size_mb:.1f} МБ")
         except Exception as e:
             self.model_info_label.setText(f"Ошибка: {e}")
 
@@ -645,7 +370,7 @@ class YOLOBenchmarkApp(QMainWindow):
 
     def on_export_finished(self, exported_path):
         self.export_btn.setEnabled(True)
-        self.export_progress.setVisible(False)  # Bug 4 fix: всегда скрываем
+        self.export_progress.setVisible(False)
         self.export_progress.setValue(0)
         if exported_path:
             self.exported_onnx_path = exported_path
@@ -662,7 +387,6 @@ class YOLOBenchmarkApp(QMainWindow):
     # ── Ручной бенчмарк ───────────────────────────────────────────────────────
 
     def run_benchmark(self, model_type):
-        # Bug 5 fix: проверяем isRunning перед стартом
         if self.benchmark_thread and self.benchmark_thread.isRunning():
             QMessageBox.warning(self, "Занято", "Бенчмарк уже выполняется")
             return
@@ -694,7 +418,7 @@ class YOLOBenchmarkApp(QMainWindow):
             label = "ONNX FP32"
 
         data_yaml = self.data_yaml_edit.text().strip()
-        if not data_yaml or not os.path.exists(data_yaml):
+        if not data_yaml or not _yaml_exists_or_builtin(data_yaml):
             QMessageBox.warning(self, "Ошибка", "Укажите корректный путь к data.yaml")
             return
 
@@ -735,7 +459,7 @@ class YOLOBenchmarkApp(QMainWindow):
             return
 
         data_yaml = self.data_yaml_edit.text().strip()
-        if not data_yaml or not os.path.exists(data_yaml):
+        if not data_yaml or not _yaml_exists_or_builtin(data_yaml):
             QMessageBox.warning(self, "Ошибка", "Укажите корректный путь к data.yaml")
             return
 
@@ -1003,21 +727,52 @@ class YOLOBenchmarkApp(QMainWindow):
                 thread.terminate()
                 thread.wait()
 
+    # ── Установка зависимостей ────────────────────────────────────────────────
+
+    def install_deps(self):
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Установка зависимостей")
+        msg.setText(
+            "<b>Выберите вариант установки:</b><br><br>"
+            "<b>CPU</b> — onnx, onnxruntime, onnxslim<br>"
+            "<b>GPU</b> — onnx, onnxruntime-gpu, onnxslim, tensorrt<br>"
+            "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;(требуется CUDA и NVIDIA GPU)<br><br>"
+            "После установки нужно <b>перезапустить</b> приложение."
+        )
+        msg.setTextFormat(Qt.RichText)
+        cpu_btn = msg.addButton("CPU", QMessageBox.AcceptRole)
+        gpu_btn = msg.addButton("GPU (CUDA)", QMessageBox.AcceptRole)
+        msg.addButton("Отмена", QMessageBox.RejectRole)
+        msg.exec_()
+
+        clicked = msg.clickedButton()
+        if clicked == cpu_btn:
+            packages = DepsInstallThread.PACKAGES_CPU
+        elif clicked == gpu_btn:
+            packages = DepsInstallThread.PACKAGES_GPU
+        else:
+            return
+
+        thread = DepsInstallThread(packages)
+        if not self._safe_replace_thread('deps_thread', thread):
+            return
+
+        self.install_deps_btn.setEnabled(False)
+        self.deps_thread.log_signal.connect(self.log)
+        self.deps_thread.finished_signal.connect(self._on_deps_finished)
+        self.deps_thread.start()
+
+    def _on_deps_finished(self):
+        self.install_deps_btn.setEnabled(True)
+        QMessageBox.information(
+            self, "Готово",
+            "Зависимости установлены.\nПерезапустите приложение, чтобы изменения вступили в силу."
+        )
+
     def closeEvent(self, event):
         self._stop_thread(self.export_thread)
         self._stop_thread(self.benchmark_thread)
         self._stop_thread(self.run_all_thread)
+        self._stop_thread(self.deps_thread)
+        logging.shutdown()
         event.accept()
-
-
-# ─── Точка входа ──────────────────────────────────────────────────────────────
-
-def main():
-    app = QApplication(sys.argv)
-    window = YOLOBenchmarkApp()
-    window.show()
-    sys.exit(app.exec_())
-
-
-if __name__ == "__main__":
-    main()
