@@ -1,0 +1,23 @@
+# GUI
+PyQt5>=5.15.0
+
+# YOLO модели и экспорт
+ultralytics>=8.3.0
+
+# Инференс ONNX
+onnxruntime>=1.16.0        # CPU
+# onnxruntime-gpu>=1.16.0  # GPU (вместо onnxruntime, если есть CUDA)
+
+# PyTorch (CPU)
+torch>=2.0.0
+torchvision>=0.15.0
+# Для GPU установите нужную CUDA-версию вручную:
+# https://pytorch.org/get-started/locally/
+
+# Квантизация ONNX INT8
+onnx>=1.14.0
+
+# Утилиты
+numpy>=1.24.0
+Pillow>=10.0.0
+PyYAML>=6.0
