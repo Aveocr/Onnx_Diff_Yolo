@@ -12,7 +12,7 @@ synthetic.yaml
 
 # Результаты бенчмарков
 results/
-
+logs/
 # Python
 __pycache__/
 *.pyc
@@ -28,3 +28,5 @@ venv/
 # Системные
 .DS_Store
 Thumbs.db
+
+step*

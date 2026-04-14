@@ -159,7 +159,11 @@ class YOLOBenchmarkApp(QMainWindow):
 
         self.half_pt_check = QCheckBox("FP16 для PyTorch")
         self.half_pt_check.setChecked(CUDA_AVAILABLE)
-        self.half_pt_check.setToolTip("Использовать half precision при валидации оригинальной PT модели")
+        if not CUDA_AVAILABLE:
+            self.half_pt_check.setEnabled(False)
+            self.half_pt_check.setToolTip("FP16 требует GPU — на CPU эмулируется и работает в десятки раз медленнее")
+        else:
+            self.half_pt_check.setToolTip("Использовать half precision при валидации оригинальной PT модели")
         opts_row.addWidget(self.half_pt_check)
 
         opts_row.addStretch()

@@ -4,9 +4,72 @@ import glob
 import json
 import csv
 import time
-import traceback
+import logging
+import threading
 from datetime import datetime
 from pathlib import Path
+
+# ─── Логирование ──────────────────────────────────────────────────────────────
+
+def _setup_logging() -> logging.Logger:
+    log_dir = Path(__file__).parent / 'logs'
+    log_dir.mkdir(exist_ok=True)
+    log_file = log_dir / f"app_{datetime.now().strftime('%Y%m%d')}.log"
+
+    fmt = logging.Formatter(
+        fmt='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+        datefmt='%H:%M:%S',
+    )
+
+    file_handler = logging.FileHandler(log_file, encoding='utf-8')
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(fmt)
+
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.WARNING)
+    console_handler.setFormatter(fmt)
+
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+    root.addHandler(file_handler)
+    root.addHandler(console_handler)
+
+    # Подавляем шумные логи Ultralytics/PIL и отключаем propagation
+    for noisy in ('ultralytics', 'PIL', 'urllib3', 'filelock'):
+        lg = logging.getLogger(noisy)
+        lg.setLevel(logging.WARNING)
+        lg.propagate = False  # не дублируем в root-хендлеры
+
+    return logging.getLogger('yolo_bench')
+
+
+logger = _setup_logging()
+
+
+def _excepthook(exc_type, exc_value, exc_tb):
+    """Перехватывает неперехваченные исключения в главном потоке."""
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+        return
+    logger.critical("Необработанное исключение:", exc_info=(exc_type, exc_value, exc_tb))
+    logging.shutdown()
+
+
+def _thread_excepthook(args):
+    """Перехватывает неперехваченные исключения в дочерних потоках (Python 3.8+)."""
+    if args.exc_type is SystemExit:
+        return
+    logger.critical(
+        "Необработанное исключение в потоке %s:",
+        args.thread.name if args.thread else "неизвестный",
+        exc_info=(args.exc_type, args.exc_value, args.exc_tb),
+    )
+
+
+sys.excepthook = _excepthook
+threading.excepthook = _thread_excepthook
+
+# ──────────────────────────────────────────────────────────────────────────────
 
 try:
     from PyQt5.QtWidgets import (
@@ -24,24 +87,20 @@ except ImportError as e:
     print("Установите зависимости: pip install PyQt5 ultralytics torch")
     sys.exit(1)
 
-try:
-    import onnxruntime as ort
-    ORT_AVAILABLE = True
-except ImportError:
-    ORT_AVAILABLE = False
-
 
 # ─── Константы ────────────────────────────────────────────────────────────────
 
 CUDA_AVAILABLE = torch.cuda.is_available()
 
 FORMAT_CONFIGS = {
-    'PyTorch':   {'format': None,     'half': False, 'int8': False, 'needs_cuda': False},
-    'ONNX FP32': {'format': 'onnx',   'half': False, 'int8': False, 'needs_cuda': False},
-    'ONNX FP16': {'format': 'onnx',   'half': True,  'int8': False, 'needs_cuda': False},
-    'ONNX INT8': {'format': 'onnx',   'half': False, 'int8': True,  'needs_cuda': False},
-    'TRT FP16':  {'format': 'engine', 'half': True,  'int8': False, 'needs_cuda': True},
-    'TRT INT8':  {'format': 'engine', 'half': False, 'int8': True,  'needs_cuda': True},
+    'PyTorch':   {'format': None,     'half': False, 'int8': False, 'post_quant': False, 'needs_cuda': False},
+    'ONNX FP32': {'format': 'onnx',   'half': False, 'int8': False, 'post_quant': False, 'needs_cuda': False},
+    'ONNX FP16': {'format': 'onnx',   'half': True,  'int8': False, 'post_quant': False, 'needs_cuda': False},
+    # INT8 для ONNX делается через onnxruntime.quantization после экспорта FP32
+    # (Ultralytics не поддерживает int8=True для format='onnx' в версиях < 8.6)
+    'ONNX INT8': {'format': 'onnx',   'half': False, 'int8': False, 'post_quant': True,  'needs_cuda': False},
+    'TRT FP16':  {'format': 'engine', 'half': True,  'int8': False, 'post_quant': False, 'needs_cuda': True},
+    'TRT INT8':  {'format': 'engine', 'half': False, 'int8': True,  'post_quant': False, 'needs_cuda': True},
 }
 
 TABLE_HEADERS = ["Формат", "mAP50", "mAP50-95", "Время(с)", "Δ mAP50 vs PT", "Скорость vs PT", "Размер (МБ)", "Размер vs PT"]
@@ -67,6 +126,92 @@ def _parse_int(line_edit, default):
         return int(line_edit.text())
     except ValueError:
         return default
+
+
+def _is_builtin_dataset(yaml_path: str) -> bool:
+    """Возвращает True для встроенных датасетов Ultralytics (без разделителей пути).
+    Например: 'coco128.yaml', 'coco128' — Ultralytics сам найдёт и скачает."""
+    return os.sep not in yaml_path and '/' not in yaml_path
+
+
+def _yaml_exists_or_builtin(yaml_path: str) -> bool:
+    """Возвращает True если yaml существует на диске ИЛИ является встроенным датасетом."""
+    return _is_builtin_dataset(yaml_path) or os.path.exists(yaml_path)
+
+
+def _check_yaml_paths(yaml_path: str) -> str:
+    """Проверяет yaml датасета. Ошибку возвращает только если:
+    - yaml-файл не существует вообще (и не является встроенным датасетом)
+    - path абсолютный и не существует на диске
+    Встроенные датасеты Ultralytics ('coco128.yaml') и относительные пути не проверяем."""
+    try:
+        # Встроенные датасеты Ultralytics (coco128.yaml и т.п.) — пропускаем проверку
+        if _is_builtin_dataset(yaml_path):
+            return ""
+
+        if not Path(yaml_path).exists():
+            return f"Файл не найден: {yaml_path}"
+
+        import yaml
+        with open(yaml_path, encoding='utf-8') as f:
+            data = yaml.safe_load(f)
+
+        base = data.get('path', '')
+        p = Path(base)
+        # Проверяем только абсолютные пути — относительные Ultralytics ищет сам
+        if p.is_absolute() and not p.exists():
+            return (
+                f"Путь датасета не найден на этой машине:\n  {base}\n"
+                "Запустите prepare_dataset.py или выберите другой data.yaml."
+            )
+        return ""
+    except Exception as e:
+        return f"Не удалось прочитать {yaml_path}: {e}"
+
+
+# ─── DepsInstallThread ───────────────────────────────────────────────────────
+
+class DepsInstallThread(QThread):
+    """Устанавливает pip-пакеты по одному, стримит вывод в лог."""
+    log_signal      = pyqtSignal(str)
+    finished_signal = pyqtSignal()
+
+    # CPU-вариант: onnxruntime без GPU
+    PACKAGES_CPU = ['onnx', 'onnxruntime', 'onnxslim']
+    # GPU-вариант: onnxruntime-gpu заменяет onnxruntime, tensorrt добавляется
+    PACKAGES_GPU = ['onnx', 'onnxruntime-gpu', 'onnxslim', 'tensorrt']
+
+    def __init__(self, packages: list):
+        super().__init__()
+        self.packages = packages
+
+    def run(self):
+        import subprocess
+        try:
+            for pkg in self.packages:
+                self.log_signal.emit(f"pip install --upgrade {pkg} ...")
+                proc = subprocess.run(
+                    [sys.executable, '-m', 'pip', 'install', '--upgrade', pkg],
+                    capture_output=True,
+                    text=True,
+                    encoding='utf-8',
+                    errors='replace',
+                )
+                if proc.returncode == 0:
+                    lines = [l for l in proc.stdout.strip().splitlines() if l.strip()]
+                    summary = lines[-1] if lines else "OK"
+                    self.log_signal.emit(f"  {summary}")
+                else:
+                    lines = [l for l in proc.stderr.strip().splitlines() if l.strip()]
+                    err = lines[-1] if lines else "неизвестная ошибка"
+                    self.log_signal.emit(f"  Ошибка: {err}")
+                    logger.error("pip install %s: %s", pkg, proc.stderr)
+        except Exception as e:
+            logger.exception("DepsInstallThread")
+            self.log_signal.emit(f"Ошибка установки: {e}")
+        finally:
+            self.log_signal.emit("Установка завершена. Перезапустите приложение.")
+            self.finished_signal.emit()
 
 
 # ─── BenchmarkThread ──────────────────────────────────────────────────────────
@@ -106,6 +251,7 @@ class BenchmarkThread(QThread):
                 half=self.half,
                 verbose=False,
                 plots=False,
+                workers=0,  # предотвращает multiprocessing spawn в потоке на Windows
             )
             val_time = time.perf_counter() - start
 
@@ -122,8 +268,8 @@ class BenchmarkThread(QThread):
                 'file_size_mb': size_mb,
             })
         except Exception as e:
+            logger.exception("BenchmarkThread [%s]", self.label)
             self.log_signal.emit(f"  Ошибка бенчмарка [{self.label}]: {e}")
-            traceback.print_exc()
             self.finished_signal.emit({})  # Bug 1 fix: всегда эмитируем
         finally:
             self.progress_signal.emit(100)
@@ -175,8 +321,8 @@ class ExportThread(QThread):
             self.log_signal.emit(f"Экспорт [{self.fmt_label}] завершён: {export_path}")
             self.finished_signal.emit(str(export_path))
         except Exception as e:
+            logger.exception("ExportThread [%s]", self.fmt_label)
             self.log_signal.emit(f"Ошибка экспорта [{self.fmt_label}]: {e}")
-            traceback.print_exc()
             self.finished_signal.emit("")
         finally:
             self.progress_signal.emit(100)
@@ -208,71 +354,129 @@ class RunAllThread(QThread):
         self.half_pt        = half_pt
 
     def run(self):
-        total   = len(self.formats_to_run) * 2
-        current = 0
+        try:
+            total   = len(self.formats_to_run) * 2
+            current = 0
 
-        for label in self.formats_to_run:
-            cfg = FORMAT_CONFIGS[label]
+            for label in self.formats_to_run:
+                cfg = FORMAT_CONFIGS[label]
 
-            # ── Экспорт ──────────────────────────────────────────────────────
-            if label == 'PyTorch':
-                model_path = self.pt_path
-                current += 1
-            else:
-                self.step_signal.emit(f"Экспорт {label}...")
-                model_path = self._do_export(label, cfg)
+                # ── Экспорт ──────────────────────────────────────────────────────
+                if label == 'PyTorch':
+                    model_path = self.pt_path
+                    current += 1
+                else:
+                    self.step_signal.emit(f"Экспорт {label}...")
+                    model_path = self._do_export(label, cfg)
+                    current += 1
+                    self.progress_signal.emit(int(current / total * 100))
+
+                    if not model_path:
+                        self.error_signal.emit(f"Экспорт {label} не удался — пропускаем")
+                        current += 1  # пропускаем и шаг бенчмарка
+                        self.progress_signal.emit(int(current / total * 100))
+                        continue
+
+                # ── Бенчмарк ─────────────────────────────────────────────────────
+                self.step_signal.emit(f"Бенчмарк {label}...")
+                half = self.half_pt if label == 'PyTorch' else cfg['half']
+                results = self._do_benchmark(model_path, label, half)
                 current += 1
                 self.progress_signal.emit(int(current / total * 100))
 
-                if not model_path:
-                    self.error_signal.emit(f"Экспорт {label} не удался — пропускаем")
-                    current += 1  # пропускаем и шаг бенчмарка
-                    self.progress_signal.emit(int(current / total * 100))
-                    continue
+                if results:
+                    self.result_signal.emit(label, results)
+                else:
+                    self.error_signal.emit(f"Бенчмарк {label} не удался")
 
-            # ── Бенчмарк ─────────────────────────────────────────────────────
-            self.step_signal.emit(f"Бенчмарк {label}...")
-            half = self.half_pt if label == 'PyTorch' else cfg['half']
-            results = self._do_benchmark(model_path, label, half)
-            current += 1
-            self.progress_signal.emit(int(current / total * 100))
-
-            if results:
-                self.result_signal.emit(label, results)
-            else:
-                self.error_signal.emit(f"Бенчмарк {label} не удался")
-
-        self.step_signal.emit("Готово")
-        self.finished_signal.emit()
+            self.step_signal.emit("Готово")
+        except Exception as e:
+            logger.exception("RunAllThread.run: неперехваченная ошибка")
+            self.log_signal.emit(f"Критическая ошибка потока: {e}")
+            self.step_signal.emit("Ошибка")
+        finally:
+            self.finished_signal.emit()
 
     def _do_export(self, label, cfg):
         try:
             self.log_signal.emit(f"[Экспорт] {label}...")
+
+            if cfg.get('post_quant'):
+                return self._do_export_onnx_int8()
+
             model  = YOLO(self.pt_path)
             kwargs = dict(
                 format=cfg['format'],
                 imgsz=self.imgsz,
                 half=cfg['half'],
-                int8=cfg['int8'],
                 dynamic=self.dynamic,
                 simplify=self.simplify,
                 opset=self.opset,
             )
+            # int8=True только для TRT — Ultralytics < 8.6 не поддерживает его для ONNX
             if cfg['int8']:
+                kwargs['int8'] = True
                 kwargs['data'] = self.data_yaml
-            raw_path = Path(str(model.export(**kwargs)))
 
-            # Копируем в .onnx/ рядом с исходным .pt под человекочитаемым именем
+            result = model.export(**kwargs)
+            if result is None:
+                self.log_signal.emit(f"  Экспорт [{label}] вернул None — возможно, не установлен onnx")
+                return ""
+            raw_path = Path(str(result))
+            if not raw_path.exists():
+                self.log_signal.emit(f"  Файл экспорта не найден: {raw_path}")
+                return ""
             dest = self._copy_to_onnx_dir(raw_path, label)
             self.log_signal.emit(f"  Сохранён: {dest}")
             return str(dest)
+        except AssertionError as e:
+            self.log_signal.emit(f"  Параметр не поддерживается текущей версией Ultralytics: {e}")
+            return ""
         except Exception as e:
             msg = str(e)
             if 'tensorrt' in msg.lower() or 'engine' in msg.lower():
+                logger.warning("RunAllThread._do_export TRT [%s]: %s", label, msg)
                 self.log_signal.emit(f"  TensorRT недоступен: {msg}")
             else:
+                logger.exception("RunAllThread._do_export [%s]", label)
                 self.log_signal.emit(f"  Ошибка: {msg}")
-            traceback.print_exc()
+            return ""
+
+    def _do_export_onnx_int8(self):
+        """INT8-квантизация через onnxruntime.quantization (работает со всеми версиями Ultralytics)."""
+        try:
+            from onnxruntime.quantization import quantize_dynamic, QuantType
+        except ImportError:
+            self.log_signal.emit("  onnxruntime не установлен. Установите: pip install onnxruntime")
+            return ""
+
+        try:
+            # Шаг 1: экспортируем FP32-ONNX как базу
+            self.log_signal.emit("  Шаг 1/2: экспорт FP32 ONNX для квантизации...")
+            model    = YOLO(self.pt_path)
+            fp32_raw = Path(str(model.export(
+                format='onnx', imgsz=self.imgsz,
+                half=False, dynamic=self.dynamic,
+                simplify=self.simplify, opset=self.opset,
+            )))
+
+            # Шаг 2: квантизация в INT8
+            self.log_signal.emit("  Шаг 2/2: квантизация INT8...")
+            pt_stem  = Path(self.pt_path).stem
+            onnx_dir = Path(self.pt_path).parent / '.onnx'
+            onnx_dir.mkdir(exist_ok=True)
+            dest = onnx_dir / f"{pt_stem}_int8.onnx"
+
+            quantize_dynamic(
+                str(fp32_raw),
+                str(dest),
+                weight_type=QuantType.QInt8,
+            )
+            self.log_signal.emit(f"  Сохранён: {dest}")
+            return str(dest)
+        except Exception as e:
+            logger.exception("_do_export_onnx_int8")
+            self.log_signal.emit(f"  Ошибка INT8-квантизации: {e}")
             return ""
 
     def _copy_to_onnx_dir(self, raw_path: Path, label: str) -> Path:
@@ -293,6 +497,13 @@ class RunAllThread(QThread):
     def _do_benchmark(self, model_path, label, half):
         try:
             self.log_signal.emit(f"[Бенчмарк] {label}: {model_path}")
+
+            # Проверяем, что путь датасета из yaml существует на этой машине
+            err = _check_yaml_paths(self.data_yaml)
+            if err:
+                self.log_signal.emit(f"  Ошибка датасета: {err}")
+                return {}
+
             model   = YOLO(model_path)
             start   = time.perf_counter()
             metrics = model.val(
@@ -303,6 +514,7 @@ class RunAllThread(QThread):
                 half=half,
                 verbose=False,
                 plots=False,
+                workers=0,  # предотвращает multiprocessing spawn в потоке на Windows
             )
             val_time = time.perf_counter() - start
             size_mb = os.path.getsize(model_path) / 1024 / 1024
@@ -316,9 +528,21 @@ class RunAllThread(QThread):
                 'fitness':     float(metrics.fitness),
                 'file_size_mb': size_mb,
             }
+        except ImportError as e:
+            if 'onnxruntime' in str(e).lower() or 'dll' in str(e).lower():
+                logger.error("onnxruntime недоступен [%s]: %s", label, e)
+                self.log_signal.emit(
+                    f"  onnxruntime не загрузился (DLL error).\n"
+                    f"  Запустите: pip install --upgrade onnxruntime\n"
+                    f"  Или установите Visual C++ Redistributable 2022 x64."
+                )
+            else:
+                logger.exception("RunAllThread._do_benchmark [%s]", label)
+                self.log_signal.emit(f"  Ошибка импорта: {e}")
+            return {}
         except Exception as e:
+            logger.exception("RunAllThread._do_benchmark [%s]", label)
             self.log_signal.emit(f"  Ошибка: {e}")
-            traceback.print_exc()
             return {}
 
 
@@ -333,6 +557,7 @@ class YOLOBenchmarkApp(QMainWindow):
         self.export_thread    = None
         self.benchmark_thread = None
         self.run_all_thread   = None
+        self.deps_thread      = None
 
         self.format_checkboxes = {}
         self.results_store     = {}
@@ -450,7 +675,7 @@ class YOLOBenchmarkApp(QMainWindow):
         opts_row.addWidget(self.dynamic_check)
 
         self.simplify_check = QCheckBox("Simplify")
-        self.simplify_check.setChecked(True)
+        self.simplify_check.setChecked(False)  # onnxslim медленный — включать вручную при необходимости
         opts_row.addWidget(self.simplify_check)
 
         self.half_pt_check = QCheckBox("FP16 для PyTorch")
@@ -543,9 +768,21 @@ class YOLOBenchmarkApp(QMainWindow):
         self.log_text.setMaximumHeight(180)
         layout.addWidget(self.log_text)
 
+        btn_row = QHBoxLayout()
         clear_btn = QPushButton("Очистить лог")
         clear_btn.clicked.connect(self.clear_log)
-        layout.addWidget(clear_btn)
+        open_log_btn = QPushButton("Открыть лог-файл")
+        open_log_btn.clicked.connect(self._open_log_file)
+        self.install_deps_btn = QPushButton("Установить зависимости")
+        self.install_deps_btn.setToolTip(
+            "Устанавливает onnx, onnxruntime (CPU или GPU) и tensorrt через pip"
+        )
+        self.install_deps_btn.clicked.connect(self.install_deps)
+        btn_row.addWidget(clear_btn)
+        btn_row.addWidget(open_log_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(self.install_deps_btn)
+        layout.addLayout(btn_row)
 
         group.setLayout(layout)
         return group
@@ -564,9 +801,18 @@ class YOLOBenchmarkApp(QMainWindow):
         ts = datetime.now().strftime("%H:%M:%S")
         self.log_text.append(f"[{ts}] {message}")
         self.log_text.moveCursor(QTextCursor.End)
+        logger.info(message)
 
     def clear_log(self):
         self.log_text.clear()
+
+    def _open_log_file(self):
+        log_dir = Path(__file__).parent / 'logs'
+        log_file = log_dir / f"app_{datetime.now().strftime('%Y%m%d')}.log"
+        if log_file.exists():
+            os.startfile(str(log_file))
+        else:
+            QMessageBox.information(self, "Лог", f"Лог-файл не найден:\n{log_file}")
 
     # ── Диалоги выбора файлов ─────────────────────────────────────────────────
 
@@ -598,18 +844,14 @@ class YOLOBenchmarkApp(QMainWindow):
         self.log(f"Найден yaml: {yamls[0]}")
 
     def update_model_info(self, path):
+        # Не загружаем модель в главном потоке — это блокирует Qt и может крашнуть
+        # на Windows из-за multiprocessing spawn. Показываем только метаданные файла.
         try:
-            if path.endswith('.pt'):
-                model = YOLO(path)
-                self.model_info_label.setText(f"PyTorch модель  |  task: {model.task}")
-            elif path.endswith('.onnx'):
-                if ORT_AVAILABLE:
-                    ort.InferenceSession(path, providers=['CPUExecutionProvider'])
-                self.model_info_label.setText("ONNX модель (валидна)")
-            elif path.endswith('.engine'):
-                self.model_info_label.setText("TensorRT engine")
-            else:
-                self.model_info_label.setText("Неизвестный формат")
+            size_mb = os.path.getsize(path) / 1024 / 1024
+            ext = Path(path).suffix.lower()
+            labels = {'.pt': 'PyTorch', '.onnx': 'ONNX', '.engine': 'TensorRT engine'}
+            fmt = labels.get(ext, 'Неизвестный формат')
+            self.model_info_label.setText(f"{fmt}  |  {size_mb:.1f} МБ")
         except Exception as e:
             self.model_info_label.setText(f"Ошибка: {e}")
 
@@ -694,7 +936,7 @@ class YOLOBenchmarkApp(QMainWindow):
             label = "ONNX FP32"
 
         data_yaml = self.data_yaml_edit.text().strip()
-        if not data_yaml or not os.path.exists(data_yaml):
+        if not data_yaml or not _yaml_exists_or_builtin(data_yaml):
             QMessageBox.warning(self, "Ошибка", "Укажите корректный путь к data.yaml")
             return
 
@@ -735,7 +977,7 @@ class YOLOBenchmarkApp(QMainWindow):
             return
 
         data_yaml = self.data_yaml_edit.text().strip()
-        if not data_yaml or not os.path.exists(data_yaml):
+        if not data_yaml or not _yaml_exists_or_builtin(data_yaml):
             QMessageBox.warning(self, "Ошибка", "Укажите корректный путь к data.yaml")
             return
 
@@ -1003,16 +1245,65 @@ class YOLOBenchmarkApp(QMainWindow):
                 thread.terminate()
                 thread.wait()
 
+    # ── Установка зависимостей ────────────────────────────────────────────────
+
+    def install_deps(self):
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Установка зависимостей")
+        msg.setText(
+            "<b>Выберите вариант установки:</b><br><br>"
+            "<b>CPU</b> — onnx, onnxruntime, onnxslim<br>"
+            "<b>GPU</b> — onnx, onnxruntime-gpu, onnxslim, tensorrt<br>"
+            "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;(требуется CUDA и NVIDIA GPU)<br><br>"
+            "После установки нужно <b>перезапустить</b> приложение."
+        )
+        msg.setTextFormat(Qt.RichText)
+        cpu_btn = msg.addButton("CPU", QMessageBox.AcceptRole)
+        gpu_btn = msg.addButton("GPU (CUDA)", QMessageBox.AcceptRole)
+        msg.addButton("Отмена", QMessageBox.RejectRole)
+        msg.exec_()
+
+        clicked = msg.clickedButton()
+        if clicked == cpu_btn:
+            packages = DepsInstallThread.PACKAGES_CPU
+        elif clicked == gpu_btn:
+            packages = DepsInstallThread.PACKAGES_GPU
+        else:
+            return
+
+        thread = DepsInstallThread(packages)
+        if not self._safe_replace_thread('deps_thread', thread):
+            return
+
+        self.install_deps_btn.setEnabled(False)
+        self.deps_thread.log_signal.connect(self.log)
+        self.deps_thread.finished_signal.connect(self._on_deps_finished)
+        self.deps_thread.start()
+
+    def _on_deps_finished(self):
+        self.install_deps_btn.setEnabled(True)
+        QMessageBox.information(
+            self, "Готово",
+            "Зависимости установлены.\nПерезапустите приложение, чтобы изменения вступили в силу."
+        )
+
     def closeEvent(self, event):
         self._stop_thread(self.export_thread)
         self._stop_thread(self.benchmark_thread)
         self._stop_thread(self.run_all_thread)
+        self._stop_thread(self.deps_thread)
+        logging.shutdown()
         event.accept()
 
 
 # ─── Точка входа ──────────────────────────────────────────────────────────────
 
 def main():
+    # На Windows multiprocessing использует spawn — freeze_support() обязателен,
+    # иначе рабочие процессы DataLoader переимпортируют модуль и крашнутся
+    import multiprocessing
+    multiprocessing.freeze_support()
+
     app = QApplication(sys.argv)
     window = YOLOBenchmarkApp()
     window.show()
